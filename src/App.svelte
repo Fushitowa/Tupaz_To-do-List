@@ -1,5 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
+  import { supabase } from './lib/supabase.js';
 
   const storageKey = 'daylist-tasks-v1';
   const noteColors = ['yellow', 'mint', 'rose', 'peach', 'sky', 'lilac'];
@@ -8,7 +9,7 @@
     { id: 'ocean', name: 'Ocean', preview: '#6489ad' },
     { id: 'lavender', name: 'Lavender', preview: '#8a78ad' },
     { id: 'coral', name: 'Coral', preview: '#c77c6d' },
-    { id: 'amber', name: 'Amber', preview: '#b08a46' },
+    { id: 'amber', name: 'Amber', preview: '#eebc4e' },
   ];
   const themeStorageKey = 'daylist-workspace-theme-v1';
   const weekdays = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
@@ -17,7 +18,8 @@
   let tasks = $state([]);
   let filter = $state('wall');
   let searchQuery = $state('');
-  let theme = $state('sage');
+  let theme = $state('amber');
+  let sortMethod = $state('recent');
   let themePickerOpen = $state(false);
   let modalOpen = $state(false);
   let modalTitle = $state('');
@@ -37,6 +39,12 @@
   let reminderPermission = $state('unsupported');
   let reminderQueue = $state([]);
   let currentTime = $state(Date.now());
+  let cloudUserId = $state(null);
+  let cloudStatus = $state('connecting');
+  let cloudError = $state('');
+  let syncTimer;
+  let syncVersion = 0;
+  let syncQueue = Promise.resolve();
 
   onMount(() => {
     try {
@@ -62,8 +70,7 @@
       if (workspaceThemes.some((option) => option.id === savedTheme)) theme = savedTheme;
     } catch { /* Theme preferences may be unavailable in private browsing. */ }
     if ('Notification' in window) reminderPermission = Notification.permission;
-    ready = true;
-    checkReminders();
+    initializeCloudTasks();
     const timer = window.setInterval(() => {
       currentTime = Date.now();
       checkReminders();
@@ -74,8 +81,113 @@
   $effect(() => {
     if (ready) {
       try { localStorage.setItem(storageKey, JSON.stringify(tasks)); } catch { /* Storage may be unavailable. */ }
+      if (supabase && cloudUserId) {
+        const snapshot = tasks.map((task) => ({ ...task }));
+        scheduleTaskSync(snapshot, cloudUserId);
+      }
     }
   });
+
+  async function initializeCloudTasks() {
+    if (!supabase) {
+      cloudStatus = 'local';
+      ready = true;
+      checkReminders();
+      return;
+    }
+
+    cloudStatus = 'connecting';
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      let user = sessionData.session?.user;
+      if (!user) {
+        const { data, error } = await supabase.auth.signInAnonymously();
+        if (error) throw error;
+        user = data.user;
+      }
+      if (!user) throw new Error('Supabase did not return a user session.');
+
+      const { data: rows, error: loadError } = await supabase
+        .from('tasks')
+        .select('id, title, done, created_at, due_at, reminded, notes, color')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false });
+      if (loadError) throw loadError;
+
+      const remoteTasks = rows.map(taskFromDatabase);
+      const remoteIds = new Set(remoteTasks.map((task) => task.id));
+      const localOnlyTasks = tasks.filter((task) => !remoteIds.has(task.id));
+      tasks = [...remoteTasks, ...localOnlyTasks];
+      cloudUserId = user.id;
+      cloudStatus = 'synced';
+      cloudError = '';
+    } catch (error) {
+      cloudStatus = 'setup';
+      cloudError = error?.message || 'Could not connect to Supabase.';
+    }
+    ready = true;
+    checkReminders();
+  }
+
+  function taskFromDatabase(row) {
+    const createdAt = new Date(row.created_at).getTime();
+    return {
+      id: String(row.id),
+      title: row.title,
+      done: Boolean(row.done),
+      createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
+      dueAt: row.due_at ? new Date(row.due_at).toISOString() : '',
+      reminded: Boolean(row.reminded),
+      notes: typeof row.notes === 'string' ? row.notes : '',
+      color: noteColors.includes(row.color) ? row.color : '',
+    };
+  }
+
+  function scheduleTaskSync(snapshot, userId) {
+    const version = ++syncVersion;
+    window.clearTimeout(syncTimer);
+    cloudStatus = 'syncing';
+    syncTimer = window.setTimeout(() => {
+      syncQueue = syncQueue.then(async () => {
+        if (version !== syncVersion) return;
+        const { data: existing, error: readError } = await supabase
+          .from('tasks').select('id').eq('user_id', userId);
+        if (readError) throw readError;
+
+        const keepIds = new Set(snapshot.map((task) => task.id));
+        const removedIds = existing.map((row) => row.id).filter((id) => !keepIds.has(id));
+        if (removedIds.length) {
+          const { error } = await supabase.from('tasks').delete().eq('user_id', userId).in('id', removedIds);
+          if (error) throw error;
+        }
+        if (snapshot.length) {
+          const payload = snapshot.map((task) => ({
+            id: task.id,
+            user_id: userId,
+            title: task.title,
+            done: task.done,
+            created_at: new Date(task.createdAt).toISOString(),
+            due_at: task.dueAt ? new Date(task.dueAt).toISOString() : null,
+            reminded: task.reminded,
+            notes: task.notes,
+            color: noteColors.includes(task.color) ? task.color : null,
+          }));
+          const { error } = await supabase.from('tasks').upsert(payload, { onConflict: 'id' });
+          if (error) throw error;
+        }
+        if (version === syncVersion) {
+          cloudStatus = 'synced';
+          cloudError = '';
+        }
+      }).catch((error) => {
+        if (version === syncVersion) {
+          cloudStatus = 'error';
+          cloudError = error?.message || 'Task sync failed.';
+        }
+      });
+    }, 350);
+  }
 
   $effect(() => {
     if (ready) {
@@ -86,6 +198,7 @@
   let selectedTheme = $derived(workspaceThemes.find((option) => option.id === theme) ?? workspaceThemes[0]);
 
   let todayLabel = $derived(new Intl.DateTimeFormat('en', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date()));
+  let greeting = $derived(new Date().getHours() < 12 ? 'morning' : new Date().getHours() < 18 ? 'afternoon' : 'evening');
   let remaining = $derived(tasks.filter((task) => !task.done).length);
   let completed = $derived(tasks.filter((task) => task.done).length);
   let visibleTasks = $derived(tasks.filter((task) => {
@@ -95,6 +208,10 @@
       || (filter === 'missed' && isMissed(task))
       || (filter === 'completed' && task.done);
     return matchesFilter && task.title.toLowerCase().includes(searchQuery.trim().toLowerCase());
+  }).sort((a, b) => {
+    if (sortMethod === 'alphabetical') return a.title.localeCompare(b.title);
+    if (sortMethod === 'due') return (a.dueAt ? new Date(a.dueAt).getTime() : Infinity) - (b.dueAt ? new Date(b.dueAt).getTime() : Infinity);
+    return b.createdAt - a.createdAt;
   }));
   let upcomingCount = $derived(tasks.filter(isUpcoming).length);
   let todayCount = $derived(tasks.filter((task) => !task.done && !isUpcoming(task) && !isMissed(task)).length);
@@ -305,7 +422,7 @@
 </script>
 
 <svelte:head>
-  <title>Daylist — a little more focused</title>
+  <title>Nizel To do List</title>
 </svelte:head>
 
 <svelte:window onkeydown={handleWindowKeydown} />
@@ -313,9 +430,9 @@
 <div class="page-backdrop theme-{theme}">
   <div class="app-shell">
     <aside class="sidebar">
-      <a class="brand" href="#home" aria-label="Daylist home">
+      <a class="brand" href="#home" aria-label="Nizel To do List home">
         <span class="brand-mark"><span></span><span></span><span></span></span>
-        <span>daylist<span class="brand-period">.</span></span>
+        <span>Nizel To do List<span class="brand-period">.</span></span>
       </a>
 
       <div class="menu-heading"><span>MENU</span><span class="menu-mark">☰</span></div>
@@ -371,6 +488,9 @@
       <header class="topbar">
         <div class="breadcrumb">MY SPACE <span>/</span> <strong>{filter === 'wall' ? 'TO-DO LIST' : filter === 'today' ? 'TODAY' : filter === 'upcoming' ? 'UPCOMING' : filter === 'missed' ? 'MISSED' : 'COMPLETED'}</strong></div>
         <div class="top-actions">
+          <span class="cloud-status cloud-{cloudStatus}" title={cloudError || (cloudStatus === 'setup' ? 'Run the Supabase setup steps to enable private cloud sync.' : 'Task storage status')}>
+            <i></i>{cloudStatus === 'synced' ? 'Cloud synced' : cloudStatus === 'syncing' || cloudStatus === 'connecting' ? 'Connecting' : cloudStatus === 'error' ? 'Sync issue' : cloudStatus === 'setup' ? 'Setup needed' : 'Local only'}
+          </span>
           {#if reminderPermission === 'granted'}
             <span class="reminder-status enabled" title="Browser reminders are enabled">◉ <span>Reminders on</span></span>
           {:else if reminderPermission === 'denied'}
@@ -386,7 +506,7 @@
 
       <section class="content">
         <div class="page-heading">
-          <div><div class="eyebrow"><span class="sun-icon">✳</span> YOUR TASKS, ALL IN ONE PLACE</div><h1>{filter === 'upcoming' ? 'Upcoming' : filter === 'today' ? 'Today' : filter === 'missed' ? 'Missed' : filter === 'completed' ? 'Completed' : 'To-do List'} <span class="heading-count">{visibleTasks.length}</span></h1></div>
+          <div><div class="eyebrow"><span class="sun-icon">✳</span> YOUR TASKS, ALL IN ONE PLACE</div><h1>{filter === 'wall' ? `Good ${greeting}.` : filter === 'upcoming' ? 'Upcoming' : filter === 'today' ? 'Today' : filter === 'missed' ? 'Missed' : 'Completed'} <span class="heading-count">{visibleTasks.length}</span></h1>{#if filter === 'wall'}<p class="heading-subtitle">What’s your plan for today?</p>{/if}</div>
           <div class="heading-date">{todayLabel}</div>
         </div>
 
@@ -426,11 +546,47 @@
       </section>
     </main>
 
+    <aside class="insights-panel" aria-label="Calendar and task options">
+      <section class="calendar-widget" aria-label="Task calendar">
+        <div class="rail-section-heading"><span>CALENDAR</span><span class="rail-heading-icon">▦</span></div>
+        <div class="rail-calendar-heading">
+          <button type="button" aria-label="Previous month" onclick={() => setCalendarMonth(-1)}>‹</button>
+          <div><strong>{new Intl.DateTimeFormat('en', { year: 'numeric' }).format(calendarMonth)}</strong><span>{new Intl.DateTimeFormat('en', { month: 'short' }).format(calendarMonth)}</span></div>
+          <button type="button" aria-label="Next month" onclick={() => setCalendarMonth(1)}>›</button>
+        </div>
+        <div class="rail-weekdays">{#each weekdays as day}<span>{day[0]}</span>{/each}</div>
+        <div class="rail-days">
+          {#each calendarDays as day (day.value)}
+            {@const hasTask = tasks.some((task) => !task.done && task.dueAt && task.dueAt.startsWith(day.value))}
+            <span class:outside={!day.inMonth} class:today={day.today} class:has-task={hasTask}>{day.day}{#if hasTask}<i></i>{/if}</span>
+          {/each}
+        </div>
+        <div class="calendar-summary"><span class="calendar-dot"></span>{upcomingCount} upcoming {upcomingCount === 1 ? 'task' : 'tasks'}</div>
+      </section>
+
+      <section class="sort-widget" aria-label="Sort tasks">
+        <div class="rail-section-heading"><span>SORT BY</span><span class="rail-heading-icon">↕</span></div>
+        <div class="sort-options">
+          <button class:active={sortMethod === 'recent'} aria-pressed={sortMethod === 'recent'} onclick={() => sortMethod = 'recent'}>Recently added</button>
+          <button class:active={sortMethod === 'due'} aria-pressed={sortMethod === 'due'} onclick={() => sortMethod = 'due'}>Due date</button>
+          <button class:active={sortMethod === 'alphabetical'} aria-pressed={sortMethod === 'alphabetical'} onclick={() => sortMethod = 'alphabetical'}>A to Z</button>
+        </div>
+      </section>
+
+      <div class="rail-palette">
+        <span class="palette-label">YOUR PALETTE</span>
+        <div class="palette-swatches" aria-label="Charcoal, warm white, and amber color palette">
+          <i></i><i></i><i></i><i></i>
+        </div>
+        <span class="palette-caption">CHARCOAL · CREAM · AMBER</span>
+      </div>
+    </aside>
+
   </div>
   {#if modalOpen}
     <div class="modal-backdrop">
       <dialog bind:this={paperDialog} class="paper-sheet paper-{modalColor}" aria-labelledby="paper-title" oncancel={(event) => { event.preventDefault(); closeEditor(); }}>
-        <div class="paper-header"><span class="paper-kicker">DAYLIST <span>·</span> YOUR TASKS</span><button type="button" class="paper-close" aria-label="Close editor" onclick={closeEditor}>×</button></div>
+        <div class="paper-header"><span class="paper-kicker">NIZEL TO DO LIST <span>·</span> YOUR TASKS</span><button type="button" class="paper-close" aria-label="Close editor" onclick={closeEditor}>×</button></div>
         <h2 id="paper-title">{editingTaskId ? 'Edit your task' : 'A new task'}</h2>
         <form class="paper-form" onsubmit={saveNote}>
           <label class="paper-label" for="paper-task-title">WHAT DO YOU NEED TO DO?</label>
@@ -493,7 +649,7 @@
     <div class="due-reminder-overlay">
       <dialog open class="due-reminder-card" aria-modal="true" aria-labelledby="due-reminder-title" aria-describedby="due-reminder-details">
         <div class="reminder-card-top">
-          <span class="reminder-brand"><span class="reminder-brand-mark">d.</span> DAYLIST REMINDER</span>
+          <span class="reminder-brand"><span class="reminder-brand-mark">N.</span> NIZEL TO DO LIST</span>
           <button class="reminder-close" type="button" aria-label="Dismiss reminder" onclick={dismissReminder}>×</button>
         </div>
         <div class="reminder-clock-mark" aria-hidden="true"><span>◷</span></div>
